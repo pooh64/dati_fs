@@ -15,7 +15,7 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	printf("pid: %d\n", (int) getpid());
+	printf("pid: %d\nsleep 100s\n", (int) getpid());
 	
 	sleep(100);
 	return 0;
