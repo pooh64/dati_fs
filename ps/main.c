@@ -8,96 +8,180 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <assert.h>
 
-int show_stat(int fd)
+/* openat FILE* in RDONLY mode
+ * error: returns NULL, sets errno */
+static FILE *proc_fstream_openat(int dirfd, char const *path)
 {
-	FILE *file = fdopen(fd, "r");
-	if (!file) {
-		perror("fdopen");
-		return -1;
+	int fd = openat(dirfd, path, O_RDONLY);
+	if (fd < 0)
+		return NULL;
+
+	return fdopen(fd, "r");
+}
+
+/* full read for files with undetermined size
+ * error: returns -1, sets errno */
+static ssize_t fstream_get_data(FILE *f, char **buf)
+{
+	char chunk[4096];
+	ssize_t nr = 0, rv;
+	void *tmp;
+	*buf = NULL;
+
+	while ((rv = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+		if (!(tmp = realloc(*buf, nr + rv))) {
+			goto handle_err;
+		}
+		*buf = tmp;
+		memcpy(*buf + nr, chunk, rv);
+		nr += rv;
 	}
 
-	int pid;
-	char comm[256];
+	if (ferror(f))
+		goto handle_err;
+
+	return nr;
+
+handle_err:
+	if (buf)
+		free(buf);
+	return -1;
+}
+
+/* /proc/[pid]/stat */
+struct proc_pid_stat {
+	pid_t pid;
+	pid_t ppid;
+	pid_t pgrp;
+	pid_t sid;
 	char state;
+	char *comm;
+};
+
+/* error: returns -1, sets errno */
+static int proc_pid_stat_get(int pid_fd, struct proc_pid_stat *stat)
+{
+	FILE *file = proc_fstream_openat(pid_fd, "stat");
+	if (!file)
+		goto handle_err_0;
+
+	if (!(stat->comm = malloc(256)))
+		goto handle_err_1;
 
 	errno = 0;
-	fscanf(file, "%d", &pid);
-	fscanf(file, " (%[^)]s", comm);
-	fscanf(file, ") %c", &state);
-	if (errno) {
-		perror("fscanf");
-		return -1;
-	}
-
-	printf("%6d  %-32.32s  %c  ", pid, comm, state);
+	fscanf(file, "%d", &stat->pid);
+	fscanf(file, " (%[^)]s", stat->comm);
+	fscanf(file, ") %c", &stat->state);
+	fscanf(file, "%d %d %d", &stat->ppid, &stat->pgrp, &stat->sid);
+	if (errno)
+		goto handle_err_2;
 
 	fclose(file);
 	return 0;
+
+handle_err_2:
+	free(stat->comm);
+handle_err_1:
+	fclose(file);
+handle_err_0:
+	return -1;
 }
 
-int show_cmdline(int fd)
+static void proc_pid_stat_destroy(struct proc_pid_stat *stat)
 {
-	ssize_t len;
-	char buf[32];
+	free(stat->comm);
+}
 
-	do {
-		len = read(fd, buf, sizeof(buf) - 1);
-		if (len < 0) {
-			perror("read");
-			return -1;
-		}
+static int proc_pid_cmdline_get(int pid_fd, char **str, size_t *sz)
+{
+	FILE *file = proc_fstream_openat(pid_fd, "cmdline");
+	if (!file)
+		goto handle_err_0;
 
-		for (int i = 0; i < len; ++i)
-			buf[i] = buf[i] ? buf[i] : ' ';
-		buf[len] = 0;
+	ssize_t rc = fstream_get_data(file, str);
+	if (rc < 0)
+		goto handle_err_1;
+	*sz = rc;
 
-		printf("%s", buf);
+	for (ssize_t i = 0; i < rc - 1; ++i) {
+		char c = (*str)[i];
+		(*str)[i] = c ? c : ' ';
+	}
 
-		break;	// comment for full cmdline out
-	} while (len);
+	fclose(file);
+	return 0;
 
-	close(fd);
+handle_err_1:
+	fclose(file);
+handle_err_0:
+	return -1;
+}
+
+static int display_head()
+{
+	printf("%-6s  %-25s  %-6s  %-6s  %-6s  %-32s\n",
+			"PID", "COMM", "PPID", "PGRP", "SID", "CMDLINE");
 	return 0;
 }
 
-#define SHOW_PID_DATA(pid_fd, str, func)		\
-do {							\
-	int fd = openat((pid_fd), (str), O_RDONLY);	\
-	if (fd < 0) {					\
-		perror("openat");			\
-		return -1;				\
-	}						\
-	(func)(fd);					\
-	/* descriptor passed so no need in close(fd) */	\
-} while (0)
+static int display_pid(int pid_fd)
+{
+	struct proc_pid_stat stat;
+	char *str;
+	ssize_t sz;
 
-int handle_pid(int proc_fd, char *pid_str)
+	if (proc_pid_stat_get(pid_fd, &stat) < 0) {
+		perror("obtain /proc/pid/stat data");
+		return -1;
+	} else {
+		printf("%6d", stat.pid);
+		printf("  %-25.25s", stat.comm);
+		printf("  %6d  %6d  %6d", stat.ppid, stat.pgrp, stat.sid);
+		proc_pid_stat_destroy(&stat);
+	}
+
+	if (proc_pid_cmdline_get(pid_fd, &str, &sz) < 0) {
+		perror("obtain /proc/pid/cmdline");
+		return -1;
+	} else if (sz) {
+		printf("  %-32.32s", str);
+		free(str);
+	}
+
+	printf("\n");
+	return 0;
+}
+
+static int handle_pid(int proc_fd, char *pid_str)
 {
 	int pid_fd = openat(proc_fd, pid_str, O_RDONLY);
 	if (pid_fd < 0) {
 		perror("openat");
-		return -1;
+		goto handle_err_0;
 	}
 
-	SHOW_PID_DATA(pid_fd, "stat", show_stat);
-	SHOW_PID_DATA(pid_fd, "cmdline", show_cmdline);
-
-	printf("\n");
+	if (display_pid(pid_fd) < 0)
+		goto handle_err_1;
 
 	close(pid_fd);
 	return 0;
+
+handle_err_1:
+	close(pid_fd);
+handle_err_0:
+	return -1;
 }
 
-int main(int argc, char **argv)
+static int proc_ps()
 {
 	DIR *proc_dir = opendir("/proc/");
 	int proc_fd = dirfd(proc_dir);
 	if (proc_fd < 0) {
 		perror("dirfd");
-		exit(1);
+		goto handle_err_0;
 	}
+	display_head();
 
 	while (1) {
 		errno = 0;
@@ -105,7 +189,7 @@ int main(int argc, char **argv)
 		if (!ent) {
 			if (errno) {
 				perror("readdir");
-				exit(1);
+				goto handle_err_1;
 			}
 			break;
 		}
@@ -116,12 +200,24 @@ int main(int argc, char **argv)
 		strtol(ent->d_name, &eptr, 0);
 		if (*eptr || errno)
 			continue;
-		assert(!errno);
 
 		if (handle_pid(proc_fd, ent->d_name) < 0)
-			exit(1);
+			goto handle_err_1;
 	}
-
 	closedir(proc_dir);
+	return 0;
+
+handle_err_1:
+	closedir(proc_dir);
+handle_err_0:
+	return -1;
+}
+
+int main(int argc, char **argv)
+{
+	if (proc_ps() < 0) {
+		fprintf(stderr, "%s failed", argv[0]);
+		exit(1);
+	}
 	return 0;
 }
