@@ -9,38 +9,48 @@
 #include <stdlib.h>
 #include <errno.h>
 
-int handle_fd(int dir_fd, char *fd_str, char *path_buf)
+/* buf size >= PATH_MAX required */
+static ssize_t read_link_str_at(int dir_fd, char *link_path, char *buf)
 {
-	ssize_t sz = readlinkat(dir_fd, fd_str, path_buf, PATH_MAX);
-	if (sz < 0) {
-		perror("readlinkat");
+	ssize_t sz = readlinkat(dir_fd, link_path, buf, PATH_MAX);
+	if (sz < 0)
+		return -1;
+
+	buf[sz] = 0;
+	return sz;
+}
+
+static int handle_fd(int dir_fd, char *fd_str, char *path_buf)
+{
+	if (read_link_str_at(dir_fd, fd_str, path_buf) < 0) {
+		perror("read_link_str_at");
 		return -1;
 	}
-	path_buf[sz] = 0;
 
 	printf("%5s -> %-64.64s\n", fd_str, path_buf);
 	return 0;
 }
 
-int handle_pid(char *pid_str)
+static int lsof_pid(char *pid_str)
 {
-	char *path_buf = malloc(PATH_MAX);
-	if (!path_buf) {
+	char *path_buf = NULL;
+	DIR *dir = NULL;
+	int dir_fd;
+
+	if (!(path_buf = malloc(PATH_MAX))) {
 		perror("malloc");
-		return -1;
+		goto handle_err;
 	}
 
 	sprintf(path_buf, "/proc/%s/fd", pid_str);
-	DIR *dir = opendir(path_buf);
-	if (!dir) {
+	if (!(dir = opendir(path_buf))) {
 		perror("opendir");
-		return -1;
+		goto handle_err;
 	}
 
-	int dir_fd = dirfd(dir);
-	if (dir_fd < 0) {
+	if ((dir_fd = dirfd(dir)) < 0) {
 		perror("dirfd");
-		return -1;
+		goto handle_err;
 	}
 
 	while (1) {
@@ -49,19 +59,24 @@ int handle_pid(char *pid_str)
 		if (!ent) {
 			if (errno) {
 				perror("readdir");
-				exit(1);
+				goto handle_err;
 			}
 			break;
 		}
 		if (ent->d_name[0] == '.')
 			continue;
 		if (handle_fd(dir_fd, ent->d_name, path_buf) < 0)
-			exit(1);
+			goto handle_err;
 	}
 
 	closedir(dir);
 	free(path_buf);
 	return 0;
+
+handle_err:
+	if (path_buf)	free(path_buf);
+	if (dir)	closedir(dir);
+	return -1;
 }
 
 int main(int argc, char **argv)
@@ -78,7 +93,7 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	if (handle_pid(argv[1]) < 0)
+	if (lsof_pid(argv[1]) < 0)
 		exit(1);
 
 	return 0;

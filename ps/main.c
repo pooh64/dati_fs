@@ -129,7 +129,7 @@ static int display_pid(int pid_fd)
 {
 	struct proc_pid_stat stat;
 	char *str;
-	ssize_t sz;
+	size_t sz;
 
 	if (proc_pid_stat_get(pid_fd, &stat) < 0) {
 		perror("obtain /proc/pid/stat data");
