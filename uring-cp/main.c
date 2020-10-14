@@ -14,13 +14,11 @@
 
 #include "io_rbuf.h"
 
-#define WQ_CAP 4
-#define RQ_CAP 4
-#define IO_BUF_SZ (16)
+#define WQ_CAP 8
+#define RQ_CAP 8
+#define IO_BUF_SZ (64)
 
 #define err_display(errc, fmt, ...) error(0, (int) (errc), fmt, ##__VA_ARGS__)
-
-#define trace(fmt, ...) fprintf(stderr, "%d: " fmt "\n", __LINE__, ##__VA_ARGS__)
 
 struct uring_context {
 	struct io_uring	uring;
@@ -90,10 +88,9 @@ int __uring_context_queue(struct uring_context *c, struct io_req *req, int alloc
 				return -ENOBUFS;
 			if (alloc) {
 				sr = io_rbuf_push(&c->rq);
-				assert(sr);
+				*sr = *req;
 			}
-			io_uring_prep_read(sqe, req->fd, req->iov.iov_base,
-					req->iov.iov_len, req->offs);
+			io_uring_prep_readv(sqe, sr->fd, &sr->iov, 1, sr->offs);
 			break;
 		case IO_REQ_PWRITE:
 			if (alloc && io_rbuf_full(&c->wq))
@@ -102,16 +99,13 @@ int __uring_context_queue(struct uring_context *c, struct io_req *req, int alloc
 				return -ENOBUFS;
 			if (alloc) {
 				sr = io_rbuf_push(&c->wq);
-				assert(sr);
+				*sr = *req;
 			}
-			io_uring_prep_write(sqe, req->fd, req->iov.iov_base,
-					req->iov.iov_len, req->offs);
+			io_uring_prep_writev(sqe, sr->fd, &sr->iov, 1, sr->offs);
 			break;
 		default:
 			return -EINVAL;
 	}
-	if (alloc)
-		*sr = *req;
 	io_uring_sqe_set_data(sqe, sr);
 	return 0;
 }
@@ -149,10 +143,8 @@ again:
 		cqe_obtained = 1;
 	} else {
 		if ((rc = io_uring_peek_cqe(&c->uring, &cqe)) < 0) {
-			if (rc == -EAGAIN) {
-				assert(!"0_0 0_0");
+			if (rc == -EAGAIN)
 				return rc;
-			}
 			return rc;
 		}
 	}
@@ -161,23 +153,20 @@ again:
 
 	if (cqe->res < 0) {
 		if (cqe->res == -EAGAIN) {
-			assert(!"0_0");
+			assert(!"0_0 - not tested branch");
 			if ((rc = uring_context_req_restart(c, req)) < 0)
 				return req->errc = rc;
 			io_uring_cqe_seen(&c->uring, cqe);
 			goto again;
 		}
-		trace("%d", cqe->res);
 		return req->errc = cqe->res;
 	}
 	
 	if (cqe->res != req->iov.iov_len) {
-		trace("restarting");
 		req->iov.iov_base += cqe->res;
 		req->iov.iov_len  -= cqe->res;
 		req->offs	  += cqe->res;
 		if ((rc = uring_context_req_restart(c, req)) < 0) {
-			trace("");
 			return req->errc = rc;
 		}
 		io_uring_cqe_seen(&c->uring, cqe);
@@ -198,12 +187,10 @@ int copy_file_read(struct uring_context *c, int infd, off_t *in_offs, size_t cop
 	size_t len = (*in_offs + IO_BUF_SZ > copy_sz) ?
 		copy_sz - *in_offs : IO_BUF_SZ;
 	void *buf = malloc(len);
-	trace("malloc: %p", buf);
 	if (!buf)
 		return -errno;
 	io_req_prep_pread(&req, infd, buf, len, *in_offs);
 	*in_offs += len;
-	trace("len: %lu\n", len);
 	if ((rc = uring_context_req_queue(c, &req)) < 0) {
 		free(buf);
 		return rc;
@@ -232,25 +219,19 @@ int copy_file(struct uring_context *c, int infd, int outfd, size_t copy_sz)
 	}
 
 	while (1) {
-		if ((rc = uring_context_submit(c)) < 0) {
-			trace("");
+		if ((rc = uring_context_submit(c)) < 0)
 			goto errout;
-		}
-		trace("");
-		if ((rc = uring_context_req_wait(c)) < 0) {
-			trace("");
+		if ((rc = uring_context_req_wait(c)) < 0)
 			goto errout;
-		}
+
 		while (io_rbuf_ready(&c->wq)) {
-			trace("");
 			struct io_req *req = io_rbuf_pop(&c->wq);
 			free(req->buf_start);
 			printf("successfull write: offs=%8.8lu\n", req->offs);
 			if (req->iov.iov_len + req->offs >= copy_sz)
-				goto complete;
+				goto completed;
 		}
 		while (io_rbuf_ready(&c->rq)) {
-			trace("");
 			rc = copy_file_write(c, outfd, io_rbuf_peek(&c->rq));
 			if (rc < 0) {
 				if (rc == -ENOBUFS)	/* currently no free space */
@@ -263,13 +244,9 @@ int copy_file(struct uring_context *c, int infd, int outfd, size_t copy_sz)
 			}
 		}
 	}
-complete:
-
-	trace("success");
-
+completed:
 	return 0;
 errout:
-	/* manually destroy uring_context after this func failure */
 	return rc;
 }
 
@@ -301,13 +278,11 @@ int main(int argc, char **argv)
 		err_display(errno, "open infile");
 		return 1;
 	}
-/*
+
 	if ((rc = get_file_size(infd, &copy_size)) < 0) {
 		err_display(-rc, "get_file_size");
 		return 1;
 	}
-*/
-	copy_size = 10;
 
 	if ((outfd = open(argv[2], O_CREAT | O_WRONLY | O_TRUNC,
 			0644)) < 0) {

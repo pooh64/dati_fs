@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <sys/uio.h>
 
+/* i/o request */
 struct io_req {
 	enum io_req_type {
 		IO_REQ_PREAD,
@@ -18,6 +19,7 @@ struct io_req {
 	unsigned		ready : 1;
 };
 
+/* Info restoration after partial i/o */
 static inline
 void io_req_restore_offs(struct io_req *r)
 {
@@ -49,6 +51,7 @@ void io_req_prep_pwrite(struct io_req *r, int fd,
 	r->type = IO_REQ_PWRITE;
 }
 
+/* Circular buffer */
 struct io_rbuf {
 	struct io_req	*buf;
 	size_t		head;
