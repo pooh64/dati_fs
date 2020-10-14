@@ -111,6 +111,14 @@ struct io_req *io_rbuf_pop(struct io_rbuf *rb)
 }
 
 static inline
+struct io_req *io_rbuf_peek(struct io_rbuf *rb)
+{
+	if (io_rbuf_empty(rb))
+		return NULL;
+	return &rb->buf[rb->tail];
+}
+
+static inline
 int io_rbuf_ready(struct io_rbuf *rb)
 {
 	if (io_rbuf_empty(rb))
