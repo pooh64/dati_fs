@@ -18,6 +18,8 @@
 
 #define err_display(errc, fmt, ...) error(0, (int) (errc), fmt, ##__VA_ARGS__)
 
+#define trace(fmt, ...) fprintf(stderr, "%d: " fmt "\n", __LINE__, ##__VA_ARGS__)
+
 struct uring_context {
 	struct io_uring	uring;
 	struct io_rbuf	rq;
@@ -161,6 +163,7 @@ again:
 			io_uring_cqe_seen(&c->uring, cqe);
 			goto again;
 		}
+		trace("%d", cqe->res);
 		return req->errc = cqe->res;
 	}
 	
@@ -168,8 +171,10 @@ again:
 		req->iov.iov_base += cqe->res;
 		req->iov.iov_len  -= cqe->res;
 		req->offs	  += cqe->res;
-		if ((rc = uring_context_req_restart(c, req)) < 0)
+		if ((rc = uring_context_req_restart(c, req)) < 0) {
+			trace("");
 			return req->errc = rc;
+		}
 		io_uring_cqe_seen(&c->uring, cqe);
 		goto again;
 	}
@@ -200,15 +205,20 @@ int copy_file(struct uring_context *c, int infd, int outfd, size_t copy_sz)
 		in_offs += len;
 		if ((rc = uring_context_req_queue(c, &req)) < 0) {
 			free(buf);
+			trace("");
 			goto errout;
 		}
 	}
 
 	while (1) {
-		if ((rc = uring_context_submit(c)) < 0)
+		if ((rc = uring_context_submit(c)) < 0) {
+			trace("");
 			goto errout;
-		if ((rc = uring_context_req_wait(c)) < 0)
+		}
+		if ((rc = uring_context_req_wait(c)) < 0) {
+			trace("");
 			goto errout;
+		}
 		while (io_rbuf_ready(&c->wq)) {
 			struct io_req *req = io_rbuf_pop(&c->wq);
 			printf("successfull write: offs=%8.8lu\n", req->offs);
