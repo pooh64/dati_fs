@@ -18,15 +18,18 @@
 #define WQ_CAP 8
 #define RQ_CAP 8
 #define URING_IO_BLOCK (1024L * 128L)
+//#define FIXED_IO
+#define DBG_PRINT(code) code
 
 #define err_display(errc, fmt, ...) error(0, (int) (errc), fmt, ##__VA_ARGS__)
 
 struct uring_marena {
-	uint8_t	*arena;
-	void	**free_blocks;
-	size_t	n_blocks;
-	size_t	n_free;
-	size_t	block_sz;
+	uint8_t		*arena;
+	struct iovec	*reg_blocks;
+	void		**free_blocks;
+	size_t		n_blocks;
+	size_t		n_free;
+	size_t		block_sz;
 };
 
 struct uring_context {
@@ -46,9 +49,13 @@ void uring_marena_init(struct uring_marena *ma,
 	release_assert(!rc);
 
 	ma->free_blocks = xmalloc(sizeof(*ma->free_blocks) * n_blocks);
+	ma->reg_blocks = xmalloc(sizeof(*ma->reg_blocks) * n_blocks);
 
-	for (size_t i = 0; i < n_blocks; ++i)
+	for (size_t i = 0; i < n_blocks; ++i) {
 		ma->free_blocks[i] = &ma->arena[i * block_sz];
+		ma->reg_blocks[i].iov_base = ma->free_blocks[i];
+		ma->reg_blocks[i].iov_len = block_sz;
+	}
 
 	ma->n_blocks = n_blocks;
 	ma->n_free = n_blocks;
@@ -65,6 +72,7 @@ static
 void uring_marena_destroy(struct uring_marena *ma)
 {
 	free(ma->arena);
+	free(ma->reg_blocks);
 	free(ma->free_blocks);
 }
 
@@ -73,14 +81,14 @@ void *uring_marena_alloc(struct uring_marena *ma)
 {
 	release_assert(ma->n_free);
 	void *buf = ma->free_blocks[--(ma->n_free)];
-	printf("allocate: %p\n", buf);
+	DBG_PRINT(printf("allocate: %p\n", buf));
 	return buf; 
 }
 
 static
 void uring_marena_free(struct uring_marena *ma, void *ptr)
 {
-	printf("free: %p\n", ptr);
+	DBG_PRINT(printf("free: %p\n", ptr));
 	uintptr_t _ptr = (uintptr_t) ptr;
 	release_assert(_ptr % ma->block_sz == 0);
 	_ptr = _ptr / ma->block_sz;
@@ -109,6 +117,10 @@ int uring_context_init(struct uring_context *c, unsigned rq_cap,
 	io_rbuf_init(&c->rq, rq_cap);
 	io_rbuf_init(&c->wq, wq_cap);
 	uring_marena_init(&c->ma, wq_cap + rq_cap, io_block_sz);
+	rc = io_uring_register_buffers(&c->uring,
+			c->ma.reg_blocks, c->ma.n_blocks);
+	if (rc < 0)
+		return rc;
 
 	return 0;
 }
@@ -134,11 +146,19 @@ void __uring_context_queue(struct uring_context *c, struct io_req *req, int allo
 
 	switch (req->type) {
 		case IO_REQ_PREAD:
+#ifdef FIXED_IO
+			op = IORING_OP_READ_FIXED;
+#else
 			op = IORING_OP_READV;
+#endif
 			q = &c->rq;
 			break;
 		case IO_REQ_PWRITE:
+#ifdef FIXED_IO
+			op = IORING_OP_WRITE_FIXED;
+#else
 			op = IORING_OP_WRITEV;
+#endif
 			q = &c->wq;
 			break;
 		default:
@@ -153,8 +173,13 @@ void __uring_context_queue(struct uring_context *c, struct io_req *req, int allo
 		*sr = *req;
 	}
 	io_req_make_aligned(sr, uring_marena_block_sz(&c->ma));
-	io_uring_prep_rw(op, sqe, sr->fd, &sr->__submit_iov, 1,
-			sr->__submit_offs);
+#ifdef FIXED_IO
+	io_uring_prep_rw(op, sqe, sr->fd, sr->__submit_iov.iov_base,
+			sr->__submit_iov.iov_len, sr->__submit_offs);
+#else
+	io_uring_prep_rw(op, sqe, sr->fd, &sr->__submit_iov,
+			1, sr->__submit_offs);
+#endif
 
 	io_uring_sqe_set_data(sqe, sr);
 }
@@ -211,7 +236,7 @@ again:
 
 	int32_t res_round = roundup(cqe->res, io_sz);	
 	if (res_round != req->__submit_iov.iov_len) {
-		release_assert(0);
+		release_assert(!"not tested");
 		req->__submit_iov.iov_base += res_round;
 		req->__submit_iov.iov_len  -= res_round;
 		req->__submit_offs	   += res_round;
@@ -235,7 +260,8 @@ void copy_file_read(struct uring_context *c, int infd, off_t *in_offs, size_t co
 	size_t io_sz = uring_marena_block_sz(&c->ma);
 	size_t len = (*in_offs + io_sz > copy_sz) ? copy_sz - *in_offs : io_sz;
 	void *buf = uring_marena_alloc(&c->ma);
-	printf("prep_read: buf=%p len=%8.8lu offs=%8.8lu\n", buf, len, *in_offs);
+	DBG_PRINT(printf("prep_read: buf=%p len=%8.8lu offs=%8.8lu\n", buf,
+				len, *in_offs));
 	io_req_prep_pread(&req, infd, buf, len, *in_offs);
 	*in_offs += len;
 	uring_context_req_queue(c, &req);
@@ -245,6 +271,8 @@ static
 void copy_file_write(struct uring_context *c, int outfd, struct io_req *req_r)
 {
 	struct io_req req_new;
+	DBG_PRINT(printf("prep_write: buf=%p len=%8.8lu offs=%8.8lu\n",
+			req_r->iov.iov_base, req_r->iov.iov_len, req_r->offs));
 	io_req_prep_pwrite(&req_new, outfd, req_r->iov.iov_base,
 			req_r->iov.iov_len, req_r->offs);
 	uring_context_req_queue(c, &req_new);
@@ -264,17 +292,16 @@ int copy_file(struct uring_context *c, int infd, int outfd, size_t copy_sz)
 			goto errout;
 		if ((rc = uring_context_req_wait(c)) < 0) {
 			if (rc == -EAGAIN) {
-				fprintf(stderr, "req_wait needs restart\n");
+				DBG_PRINT(printf("req_wait needs restart\n"));
 				continue;
 			}
-			printf("%d\n", __LINE__);
 			goto errout;
 		}
 
 		while (io_rbuf_ready(&c->wq)) {
 			struct io_req *req = io_rbuf_pop(&c->wq);
 			uring_marena_free(&c->ma, req->iov.iov_base);
-			printf("successfull write: offs=%8.8lu\n", req->offs);
+			DBG_PRINT(printf("successfull write: offs=%8.8lu\n", req->offs));
 			if (req->iov.iov_len + req->offs >= copy_sz)
 				goto completed;
 		}
