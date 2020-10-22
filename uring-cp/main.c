@@ -21,8 +21,6 @@
 //#define FIXED_IO
 #define DBG_PRINT(code) code
 
-#define err_display(errc, fmt, ...) error(0, (int) (errc), fmt, ##__VA_ARGS__)
-
 struct uring_marena {
 	uint8_t		*arena;
 	struct iovec	*reg_blocks;
@@ -81,14 +79,14 @@ void *uring_marena_alloc(struct uring_marena *ma)
 {
 	release_assert(ma->n_free);
 	void *buf = ma->free_blocks[--(ma->n_free)];
-	DBG_PRINT(printf("allocate: %p\n", buf));
+	DBG_PRINT(printf("allocate  : buf=%p\n", buf));
 	return buf; 
 }
 
 static
 void uring_marena_free(struct uring_marena *ma, void *ptr)
 {
-	DBG_PRINT(printf("free: %p\n", ptr));
+	DBG_PRINT(printf("free      : buf=%p\n", ptr));
 	uintptr_t _ptr = (uintptr_t) ptr;
 	release_assert(_ptr % ma->block_sz == 0);
 	_ptr = _ptr / ma->block_sz;
@@ -231,13 +229,16 @@ again:
 			io_uring_cqe_seen(&c->uring, cqe);
 			goto again;
 		}
+		DBG_PRINT(printf("io failed : buf=%p\n",
+					req->__submit_iov.iov_base));
 		return req->res = cqe->res;
 	}
 
 	int32_t res_round = roundup(cqe->res, io_sz);	
 	if (res_round != req->__submit_iov.iov_len) {
 		release_assert(!"not tested");
-		req->__submit_iov.iov_base += res_round;
+		req->__submit_iov.iov_base =
+			ptr_add(req->__submit_iov.iov_base, res_round);
 		req->__submit_iov.iov_len  -= res_round;
 		req->__submit_offs	   += res_round;
 		req->res		   += res_round;
@@ -260,7 +261,7 @@ void copy_file_read(struct uring_context *c, int infd, off_t *in_offs, size_t co
 	size_t io_sz = uring_marena_block_sz(&c->ma);
 	size_t len = (*in_offs + io_sz > copy_sz) ? copy_sz - *in_offs : io_sz;
 	void *buf = uring_marena_alloc(&c->ma);
-	DBG_PRINT(printf("prep_read: buf=%p len=%8.8lu offs=%8.8lu\n", buf,
+	DBG_PRINT(printf("prep_read : buf=%p len=%8.8lu offs=%8.8lu\n", buf,
 				len, *in_offs));
 	io_req_prep_pread(&req, infd, buf, len, *in_offs);
 	*in_offs += len;
@@ -301,7 +302,7 @@ int copy_file(struct uring_context *c, int infd, int outfd, size_t copy_sz)
 		while (io_rbuf_ready(&c->wq)) {
 			struct io_req *req = io_rbuf_pop(&c->wq);
 			uring_marena_free(&c->ma, req->iov.iov_base);
-			DBG_PRINT(printf("successfull write: offs=%8.8lu\n", req->offs));
+			DBG_PRINT(printf("done write: offs=%8.8lu\n", req->offs));
 			if (req->iov.iov_len + req->offs >= copy_sz)
 				goto completed;
 		}
