@@ -5,7 +5,13 @@
 #include <stdint.h>
 #include <error.h>
 
+#define div_rup(x, y) ({		\
+	const typeof(y) __y = y;	\
+	((x) + (__y - 1)) / __y;	\
+})
+
 void *xmalloc(size_t sz);
+void *xmemalign(size_t align, size_t sz);
 
 void __release_assert(char const *file, int line, char const *desr);
 
