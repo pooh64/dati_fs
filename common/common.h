@@ -10,6 +10,11 @@
 	((x) + (__y - 1)) / __y;	\
 })
 
+#define min(x, y) ({                    \
+        typeof(x) __x = (x);            \
+        typeof(y) __y = (y);            \
+        (__x < __y) ? __x : __y;  })
+
 void *xmalloc(size_t sz);
 void *xmemalign(size_t align, size_t sz);
 
