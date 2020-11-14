@@ -11,9 +11,9 @@
 #include "common.h"
 
 #define EXT2_I_NBLOCKS(sb, i) ((i)->i_blocks / (2 << (sb)->s_log_block_size))
-
 #define EXT2_I_FTYPE(i) ((i)->i_mode & (0xf000))
-#define EXT2_DIRENT_NAME_LEN(d) ((d)->name_len & 0xff)
+
+#define E2IMG_INCOMPAT_SUPPORTED (EXT2_FEATURE_INCOMPAT_FILETYPE)
 
 struct e2img {
 	int fd;
@@ -109,6 +109,8 @@ int e2img_open(struct e2img *fs, char const *path)
 
 	rc = __init_super_block(fs);
 	fs->blk_sz = EXT2_BLOCK_SIZE(fs->sb);
+
+	release_assert(!(fs->sb->s_feature_incompat & ~E2IMG_INCOMPAT_SUPPORTED));
 	return rc;
 }
 
@@ -236,12 +238,26 @@ out:
 	return rc;
 }
 
+static char *ftype_str_tab[EXT2_FT_MAX] = {
+	[EXT2_FT_UNKNOWN]	= "unknown",
+	[EXT2_FT_REG_FILE]	= "regular",
+	[EXT2_FT_DIR]		= "directory",
+	[EXT2_FT_CHRDEV]	= "char. device",
+	[EXT2_FT_BLKDEV]	= "blk. device",
+	[EXT2_FT_FIFO]		= "fifo",
+	[EXT2_FT_SOCK]		= "socket",
+	[EXT2_FT_SYMLINK]	= "symlink",
+};
+
 static
 int print_dirent_info(struct ext2_dir_entry *dirent, void *priv)
 {
-	(void) priv;
-	printf("ino: %8.u name: %.*s\n", dirent->inode,
-			EXT2_DIRENT_NAME_LEN(dirent), dirent->name);
+	struct e2img *fs = priv;
+	printf("ino: %8.u name: %.*s", dirent->inode,
+		ext2fs_dirent_name_len(dirent), dirent->name);
+	if (EXT2_HAS_INCOMPAT_FEATURE(fs->sb, EXT2_FEATURE_INCOMPAT_FILETYPE))
+		printf(" \ttype: %s", ftype_str_tab[ext2fs_dirent_file_type(dirent)]);
+	printf("\n");
 	return 0;
 }
 
@@ -255,11 +271,8 @@ static
 int dirent_cmp(struct ext2_dir_entry *dirent, void *priv)
 {
 	struct dirent_cmp_data *s = priv;
-#if 0
-	printf("dirent_cmp: %.*s %.*s\n", s->name_len, s->name,
-			EXT2_DIRENT_NAME_LEN(dirent), dirent->name);
-#endif
-	if (s->name_len != EXT2_DIRENT_NAME_LEN(dirent))
+
+	if (s->name_len != ext2fs_dirent_name_len(dirent))
 		return 0;
 	int rc = memcmp(s->name, dirent->name, s->name_len);
 	if (rc)
@@ -321,7 +334,7 @@ int get_strtoul(char const *str, unsigned long *val)
 	return 0;
 }
 
-int ext2info_print_file(struct e2img *fs, struct ext2_inode *inode)
+int ext2info_print_regfile(struct e2img *fs, struct ext2_inode *inode)
 {
 	ssize_t rc = 0;
 	void *blk = NULL;
@@ -357,17 +370,21 @@ int ext2info_process_ino(struct e2img *fs, ext2_ino_t ino)
 	}
 
 	if (LINUX_S_ISDIR(inode.i_mode)) {
-		if ((rc = e2img_iterate_dir(fs, &inode, print_dirent_info, NULL)) < 0) {
+		if ((rc = e2img_iterate_dir(fs, &inode, print_dirent_info, fs)) < 0) {
 			err_display(-rc, "e2img_iterate_dir");
 			return rc;
 		}
 		return 0;
 	}
-
-	if ((rc = ext2info_print_file(fs, &inode)) < 0) {
-		err_display(-rc, "ext2info_print_file");
-		return rc;
+	if (LINUX_S_ISREG(inode.i_mode)) {
+		if ((rc = ext2info_print_regfile(fs, &inode)) < 0) {
+			err_display(-rc, "ext2info_print_file");
+			return rc;
+		}
+		return 0;
 	}
+
+	fprintf(stderr, "can't read this type of file\n");
 	return 0;
 }
 
