@@ -42,7 +42,7 @@ ssize_t blk_read(int fd, size_t blk_sz, void *buf, size_t len, size_t off)
 }
 
 static
-ssize_t e2img_blk_read(struct e2img *fs, void *buf, blk64_t len, blk64_t off)
+ssize_t e2img_blk_read(struct e2img *fs, void *buf, blk_t len, blk_t off)
 {
 	ssize_t rc = blk_read(fs->fd, fs->blk_sz, buf, len, off);
 	if (!(rc < 0) && rc != len)
@@ -52,7 +52,7 @@ ssize_t e2img_blk_read(struct e2img *fs, void *buf, blk64_t len, blk64_t off)
 
 /* dummy buffer cache */
 static
-int e2img_bcache_access(struct e2img *fs, blk64_t blkno, void **blk)
+int e2img_bcache_access(struct e2img *fs, blk_t blkno, void **blk)
 {
 	ssize_t rc;
 	*blk = xmemalign(fs->blk_sz, fs->blk_sz);
@@ -162,12 +162,36 @@ int e2img_read_inode(struct e2img *fs, ext2_ino_t ino, struct ext2_inode *inode)
 
 static
 int e2img_inode_get_blkno(struct e2img *fs, struct ext2_inode *inode,
-		blk64_t file_blkno, blk64_t *fs_blkno)
+		blk_t file_blkno, blk_t *fs_blkno)
 {
-	if (file_blkno < EXT2_NDIR_BLOCKS)
+	int rc;
+	void *blk = NULL;
+	ext2_off_t per_blk = EXT2_ADDR_PER_BLOCK(fs->sb);
+
+	if (file_blkno < EXT2_NDIR_BLOCKS) {
 		*fs_blkno = inode->i_block[file_blkno];
-	else
-		release_assert(0); /* TODO: Indirect blocks */
+		return 0;
+	}
+	file_blkno -= (EXT2_NDIR_BLOCKS - 1);
+
+	blk_t level[3];
+	int indir_lvl = 0;
+	for (int i = 0; i < ARRAY_SIZE(level) && file_blkno; ++i) {
+		level[i] = --file_blkno % per_blk;
+		file_blkno = file_blkno / per_blk;
+		indir_lvl++;
+	}
+	release_assert(!file_blkno);
+
+	blk_t no = inode->i_block[(EXT2_IND_BLOCK - 1) + indir_lvl];
+	for (int i = indir_lvl; i > 0; --i) {
+		if ((rc = e2img_bcache_access(fs, no, &blk) >= 0) < 0)
+			return rc;
+		no = ((blk_t*) blk)[level[i - 1]];
+		if ((rc = e2img_bcache_release(fs, blk) >= 0) < 0)
+			return rc;
+	}
+	*fs_blkno = no;
 	return 0;
 }
 
@@ -176,7 +200,7 @@ int e2img_iterate_dir(struct e2img *fs, struct ext2_inode *inode,
 		int (*func)(struct ext2_dir_entry *dirent, void *priv), void *priv)
 {
 	ssize_t rc;
-	blk64_t file_blkno, fs_blkno;
+	blk_t file_blkno, fs_blkno;
 	ext2_off64_t fpos, fsize = EXT2_I_SIZE(inode);
 	void *blk = NULL;
 
@@ -303,7 +327,7 @@ int ext2info_print_file(struct e2img *fs, struct ext2_inode *inode)
 	void *blk = NULL;
 	ssize_t file_sz = EXT2_I_SIZE(inode);
 	for (ssize_t i = 0; i < file_sz; i += fs->blk_sz) {
-		blk64_t blkno;
+		blk_t blkno;
 		if ((rc = e2img_inode_get_blkno(fs, inode, i / fs->blk_sz, &blkno)) < 0)
 			goto out;
 		if (blk && (rc = e2img_bcache_release(fs, blk)) < 0) {
@@ -403,16 +427,19 @@ int main(int argc, char **argv)
 	if (inopath) {
 		if ((rc = e2img_path_lookup(&img, inopath, &ino)) < 0) {
 			err_display(-rc, "e2img_path_lookup");
-			return 1;
+			goto out_close;
 		}
 	}
 
 	if (ext2info_process_ino(&img, ino) < 0)
-		return 1;
+		goto out_close;
 
 	if ((rc = e2img_close(&img)) < 0) {
 		err_display(-rc, "e2img_close");
 		return 1;
 	}
 	return 0;
+out_close:
+	e2img_close(&img);
+	return 1;
 }
