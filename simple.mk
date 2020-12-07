@@ -3,7 +3,7 @@ obj += $(src:.c=.o)
 dep += $(obj:.o=.d)
 
 CC = gcc
-CFLAGS += -g --std=gnu11 -MMD -Wall -Wpointer-arith
+CFLAGS += -g -O0 --std=gnu11 -MMD -Wall -Wpointer-arith
 CFLAGS += -I../common
 LDFLAGS +=
 
@@ -16,4 +16,4 @@ a.out: $(obj)
 
 .PHONY: clean
 clean:
-	rm -f a.out $(obj) $(dep)
+	rm -f $(obj) $(dep)
